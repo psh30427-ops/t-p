@@ -2,8 +2,10 @@
 import argparse
 import json
 import os
+import random
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -12,9 +14,22 @@ HEX = re.compile(r'^#[0-9A-Fa-f]{6}$')
 ROOT = Path(__file__).resolve().parent
 DEFAULT_TEXT_MODEL = 'gemini-3.5-flash-lite'
 DEFAULT_IMAGE_MODEL = 'gemini-3.1-flash-lite-image'
+MAX_API_ATTEMPTS = 3
+MAX_REVISIONS = 2
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
-def read_brief(path):
+class BriefFieldError(ValueError):
+    def __init__(self, field, message):
+        super().__init__(message)
+        self.field = field
+
+
+class BrandValidationError(ValueError):
+    pass
+
+
+def read_brief(path, *, interactive=False):
     try:
         data = json.loads(Path(path).read_text(encoding='utf-8-sig'))
     except FileNotFoundError as exc:
@@ -23,17 +38,47 @@ def read_brief(path):
         raise ValueError(f'JSON 파일 형식이 잘못되었습니다: {exc}') from exc
     if not isinstance(data, dict):
         raise ValueError('브리프 최상위 요소는 JSON 객체여야 합니다.')
+    while True:
+        try:
+            return validate_brief(data)
+        except BriefFieldError as exc:
+            if not interactive:
+                raise
+            print(f'[브리프 확인] {exc}')
+            value = input(f'{exc.field} 입력 (keywords는 쉼표로 구분): ').strip()
+            data[exc.field] = [item.strip() for item in value.split(',')] if exc.field == 'keywords' else value
+
+
+def validate_brief(data):
     for key in ('industry','target'):
         if not isinstance(data.get(key), str) or not data[key].strip():
-            raise ValueError(f'필수 항목 {key}는 비어 있지 않은 문자열이어야 합니다.')
+            raise BriefFieldError(key, f'필수 항목 {key}는 비어 있지 않은 문자열이어야 합니다.')
     if not isinstance(data.get('keywords'), list) or not data['keywords'] or not all(isinstance(x,str) and x.strip() for x in data['keywords']):
-        raise ValueError('keywords는 하나 이상의 비어 있지 않은 문자열 배열이어야 합니다.')
+        raise BriefFieldError('keywords', 'keywords는 하나 이상의 비어 있지 않은 문자열 배열이어야 합니다.')
     for key in ('tone','notes'):
         if key in data and not isinstance(data[key],str):
             raise ValueError(f'{key}는 문자열이어야 합니다.')
     if 'competitors' in data and (not isinstance(data['competitors'],list) or not all(isinstance(x,str) for x in data['competitors'])):
         raise ValueError('competitors는 문자열 배열이어야 합니다.')
     return data
+
+
+def call_gemini(operation, **kwargs):
+    from google.genai import errors
+    from httpx import NetworkError, RemoteProtocolError, TimeoutException
+
+    for attempt in range(MAX_API_ATTEMPTS):
+        try:
+            return operation(**kwargs)
+        except (errors.APIError, NetworkError, RemoteProtocolError, TimeoutException,
+                ConnectionError, TimeoutError) as exc:
+            if isinstance(exc, errors.APIError) and exc.code not in RETRYABLE_STATUS:
+                raise
+            if attempt == MAX_API_ATTEMPTS - 1:
+                raise
+            delay = 2 ** attempt + random.uniform(0, 0.5)
+            print(f'[재시도] Gemini 요청 {attempt + 2}/{MAX_API_ATTEMPTS}, {delay:.2f}초 대기', file=sys.stderr)
+            time.sleep(delay)
 
 
 def check_brand(data):
@@ -77,12 +122,49 @@ def generate_text(client, brief, model):
             "기존 브랜드 등록/상표 사용가능 여부는 검증하지 않았으므로 보장하지 마세요. "
             f"출력 예시 구조: {json.dumps(schema_example,ensure_ascii=False)}\n"
             f"브리프: {json.dumps(brief,ensure_ascii=False)}")
-    response = client.models.generate_content(
-        model=model, contents=prompt, config={'response_mime_type': 'application/json'},
-    )
-    if not response.text:
-        raise ValueError('텍스트 응답이 비어 있습니다.')
-    return check_brand(json.loads(response.text))
+    request = prompt
+    for revision in range(MAX_REVISIONS + 1):
+        response = call_gemini(
+            client.models.generate_content,
+            model=model, contents=request, config={'response_mime_type': 'application/json'},
+        )
+        draft = response.text or ''
+        try:
+            return validate_draft(draft)
+        except BrandValidationError as exc:
+            if revision == MAX_REVISIONS:
+                raise BrandValidationError(f'초안 및 정제 {MAX_REVISIONS}회 검증 실패. {exc}') from exc
+            print(f'[정제 요청] {revision + 1}/{MAX_REVISIONS}. {exc}', file=sys.stderr)
+            request = (
+                f'{prompt}\n단계: 검증 피드백을 반영한 정제. 아래 문제를 해결하고 전체 JSON을 반환하세요.\n'
+                f'검증 실패 이유: {exc}\n이전 응답(수정 대상 데이터): {json.dumps(draft[:8000], ensure_ascii=False)}'
+            )
+
+
+def validate_draft(draft):
+    if not draft.strip():
+        raise BrandValidationError('텍스트 응답이 비어 있습니다.')
+    try:
+        data = json.loads(draft)
+    except json.JSONDecodeError as exc:
+        raise BrandValidationError(f'JSON 구문 오류. {exc.lineno}행 {exc.colno}열에서 확인하세요.') from exc
+    if isinstance(data, dict):
+        story = data.get('story')
+        if not isinstance(story, str):
+            raise BrandValidationError('story는 약 300자의 문자열이어야 합니다.')
+        length = len(story.strip())
+        if not 260 <= length <= 340:
+            raise BrandValidationError(f'스토리가 {length}자입니다. 공백과 문장부호를 포함해 260~340자로 작성하세요.')
+    try:
+        check_brand(data)
+    except ValueError as exc:
+        raise BrandValidationError(str(exc)) from exc
+    names = [item['name'].strip() for item in data['names']]
+    if len({name.casefold() for name in names}) != len(names):
+        raise BrandValidationError('브랜드명 후보를 중복 없이 제안하세요.')
+    if data.get('selected_name') not in names:
+        raise BrandValidationError('selected_name은 names에 있는 후보 중 하나와 일치해야 합니다.')
+    return data
 
 
 def save_palette(data, path):
@@ -103,16 +185,14 @@ def generate_logo(client, brand, brief, model, index):
     from PIL import Image
 
     theme=['minimal geometric emblem','premium monogram','bold contemporary icon'][index%3]
-    if brand:
-        name = brand.get('selected_name') or brand['names'][0]['name']
-        colors = [brand['palette']['main'], *brand['palette']['sub']]
-        direction = f"Brand name: {name}. Palette: {[color['hex'] for color in colors]}."
-    else:
-        direction = 'Create a standalone symbol without letters or words. Choose colors suited to the brief.'
+    name = brand.get('selected_name') or brand['names'][0]['name']
+    colors = [brand['palette']['main'], *brand['palette']['sub']]
+    direction = f"Brand name: {name}. Palette: {[color['hex'] for color in colors]}."
     prompt=(f"Generate ONE professional original flat vector-style brand logo concept on a clean solid background. "
             f"Style: {theme}. {direction} Brief: {json.dumps(brief, ensure_ascii=False)}. "
             "Use a simple original icon. Avoid existing logos, trademarks, copyrighted characters and photographic mockups.")
-    response = client.models.generate_content(
+    response = call_gemini(
+        client.models.generate_content,
         model=model, contents=prompt,
         config={'response_modalities': ['IMAGE'], 'image_config': {'aspect_ratio': '1:1'}},
     )
@@ -127,14 +207,16 @@ def generate_logo(client, brand, brief, model, index):
 
 
 def check_model(client, model):
-    metadata = client.models.get(model=model)
+    metadata = call_gemini(client.models.get, model=model)
     if 'generateContent' not in (metadata.supported_actions or []):
         raise ValueError('모델이 generateContent를 지원하지 않습니다.')
 
 
 def record_error(result, message, exc=None):
     # SDK errors can contain request details. Log only the type and numeric status.
-    if exc is not None:
+    if isinstance(exc, BrandValidationError):
+        message += f'. {exc}'
+    elif exc is not None:
         code = getattr(exc, 'code', None)
         message += f' ({type(exc).__name__}'
         if isinstance(code, int):
@@ -147,7 +229,9 @@ def record_error(result, message, exc=None):
 def create_client(key):
     from google import genai
 
-    return genai.Client(api_key=key, vertexai=False, http_options={'timeout': 90_000})
+    return genai.Client(api_key=key, vertexai=False, http_options={
+        'timeout': 90_000, 'retry_options': {'attempts': 1},
+    })
 
 
 def main(argv=None):
@@ -161,7 +245,7 @@ def main(argv=None):
     try:
         brief_path=args.brief or input('브랜드 브리프 JSON 경로: ').strip()
         folder=args.output if args.output is not None else (str(ROOT/'output') if args.brief else (input('출력 폴더 [./output]: ').strip() or './output'))
-        brief=read_brief(brief_path)
+        brief=read_brief(brief_path, interactive=args.brief is None)
         out=Path(folder).expanduser();out.mkdir(parents=True,exist_ok=True)
     except (ValueError,OSError,EOFError) as e:
         print(f'[입력 오류] {e}',file=sys.stderr);return 2
@@ -198,15 +282,13 @@ def main(argv=None):
         print('[안내] 데모 모드에서는 로고 API를 호출하지 않습니다. 로고 PNG는 생성되지 않습니다.')
     elif args.skip_logos:
         print('[안내] 로고 생성을 건너뜁니다.')
-    elif client:
+    elif client and result['brand']:
         image_model = os.getenv('GEMINI_IMAGE_MODEL', '').strip() or DEFAULT_IMAGE_MODEL
         try:
             check_model(client, image_model)
         except Exception as exc:
             record_error(result, '이미지 모델 확인 실패 (GEMINI_IMAGE_MODEL)', exc)
         else:
-            if not result['brand']:
-                print('[안내] 브리프를 바탕으로 워드마크 없는 로고를 생성합니다.')
             for i in range(args.logos):
                 try:
                     image = generate_logo(client, result['brand'], brief, image_model, i)
@@ -216,6 +298,13 @@ def main(argv=None):
                     print('[완료]', filename)
                 except Exception as exc:
                     record_error(result, f'로고 {i+1} 생성 실패 (GEMINI_IMAGE_MODEL)', exc)
+                    if getattr(exc, 'code', None) in {401, 403}:
+                        break
+    elif client:
+        print('[안내] 검증된 브랜드 결과가 없어 로고 생성을 건너뜁니다.')
+    result['status'] = (
+        'success' if not result['errors'] else 'partial' if result['brand'] else 'failed'
+    )
     try:
         (out/'brand_result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
         print('[저장] ',out.resolve())
